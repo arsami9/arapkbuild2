@@ -1,13 +1,21 @@
-# AR APK BUILD — Real Release APK builder
+# AR APK BUILD — Real Release APK builder (v2)
 # Triggered via workflow_dispatch by the Cloudflare Worker (which first
-# verifies the caller's Firebase ID token). Builds a Capacitor WebView app
-# and signs the release APK with the keystore stored in repo Secrets.
+# verifies the caller's Firebase ID token). Builds and signs a release APK
+# with the keystore stored in repo Secrets.
+#
+# Project types (input project_type):
+#   webview  Capacitor app that loads start_url (URL required)
+#   html     Capacitor app that bundles the project's own files, which the
+#            Worker committed under builds/<build_id>/ before dispatching
+#   blank    Capacitor app with only the built-in fallback page
+#   native   Real native compile: the project's Kotlin/Java sources are
+#            compiled with a minimal Gradle/AGP scaffold (job build-native)
 #
 # Required repo Secrets (Settings → Secrets and variables → Actions):
 #   KEYSTORE_BASE64    base64 of your release keystore (.jks / .keystore)
 #   KEYSTORE_PASSWORD  keystore password
 #   KEY_ALIAS          key alias inside the keystore
-#   KEY_PASSWORD       key password
+#   KEY_PASSWORD       key password (for the PKCS12 keystore = store password)
 # NO secrets are ever committed to this repo.
 
 name: build-apk
@@ -29,8 +37,9 @@ on:
         required: true
         type: string
       start_url:
-        description: "WebView start URL the app loads"
-        required: true
+        description: "Website URL the app loads (WebView type only; optional otherwise)"
+        required: false
+        default: ""
         type: string
       version_name:
         description: "versionName, e.g. 1.0.0"
@@ -48,16 +57,27 @@ on:
         default: ""
         type: string
       icon_url:
-        description: "Optional 1024x1024 PNG icon URL (empty = default Capacitor icon)"
+        description: "Optional 1024x1024 PNG icon URL (empty = default icon)"
         required: false
         default: ""
         type: string
+      project_type:
+        description: "webview | html | blank | native"
+        required: false
+        default: "webview"
+        type: string
+      language:
+        description: "Native projects: kotlin | java"
+        required: false
+        default: "kotlin"
+        type: string
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
+    if: ${{ inputs.project_type != 'native' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -96,7 +116,7 @@ jobs:
           npm init -y >/dev/null
           npm install @capacitor/core@^6 @capacitor/cli@^6 @capacitor/android@^6
           mkdir -p web
-          # Local fallback page shown only if the remote URL cannot load.
+          # Local fallback page (also the whole app for the blank type).
           cat > web/index.html <<'HTML'
           <!doctype html><html><head><meta charset="utf-8">
           <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -104,15 +124,28 @@ jobs:
           <body style="font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
           <p>Loading… please check your internet connection.</p></body></html>
           HTML
-          # capacitor.config.json is generated from dispatch inputs.
+          # HTML type: the app's real content is the project's own files,
+          # which the Worker committed under builds/<build_id>/.
+          if [ "$PTYPE" = "html" ]; then
+            SRC="$GITHUB_WORKSPACE/builds/$BUILD_ID"
+            [ -d "$SRC" ] || { echo "ERROR: no project files found at builds/$BUILD_ID"; exit 1; }
+            cp -r "$SRC"/. web/
+            [ -f web/index.html ] || { echo "ERROR: an HTML/CSS/JS project needs an index.html file"; exit 1; }
+            echo "Bundled project files:"; find web -type f | head -50
+          fi
+          # capacitor.config.json is generated from dispatch inputs. The
+          # Website URL is OPTIONAL: server.url is set only when one was
+          # given; otherwise the app serves the bundled web files.
           node -e '
             const fs = require("fs");
             const cfg = {
               appId: process.env.PKG,
               appName: process.env.APP_NAME,
-              webDir: "web",
-              server: { url: process.env.START_URL, cleartext: false, androidScheme: "https" }
+              webDir: "web"
             };
+            if (process.env.START_URL) {
+              cfg.server = { url: process.env.START_URL, cleartext: false, androidScheme: "https" };
+            }
             fs.writeFileSync("capacitor.config.json", JSON.stringify(cfg, null, 2));
           '
           npx cap add android
@@ -121,6 +154,8 @@ jobs:
           PKG: ${{ inputs.package_name }}
           APP_NAME: ${{ inputs.app_name }}
           START_URL: ${{ inputs.start_url }}
+          PTYPE: ${{ inputs.project_type }}
+          BUILD_ID: ${{ inputs.build_id }}
 
       - name: Apply name, version, permissions, icon
         shell: bash
@@ -251,3 +286,356 @@ jobs:
           name: app-release-${{ inputs.build_id }}
           path: app-release-${{ inputs.build_id }}.apk
           retention-days: 7
+
+      - name: Clean up delivered project files
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request, urllib.error
+          repo = os.environ["GITHUB_REPOSITORY"]
+          token = os.environ["GH_TOKEN"]
+          build_id = os.environ["BUILD_ID"]
+          def api(method, path, payload=None):
+              req = urllib.request.Request(
+                  "https://api.github.com" + path,
+                  method=method,
+                  data=json.dumps(payload).encode() if payload is not None else None,
+                  headers={"Authorization": "Bearer " + token,
+                           "Accept": "application/vnd.github+json",
+                           "Content-Type": "application/json",
+                           "User-Agent": "ar-apk-build-cleanup"})
+              try:
+                  with urllib.request.urlopen(req) as r:
+                      body = r.read().decode()
+                      return json.loads(body) if body else {}
+              except urllib.error.HTTPError as e:
+                  if e.code == 404:
+                      return None
+                  raise
+          def delete_tree(path):
+              items = api("GET", f"/repos/{repo}/contents/{path}?ref=main")
+              if items is None:
+                  return
+              for it in items:
+                  if it["type"] == "dir":
+                      delete_tree(it["path"])
+                  else:
+                      api("DELETE", f"/repos/{repo}/contents/{it['path']}",
+                          {"message": f"cleanup build files {build_id}", "sha": it["sha"]})
+          delete_tree(f"builds/{build_id}")
+          print("cleanup done")
+          PY
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_ID: ${{ inputs.build_id }}
+
+  build-native:
+    if: ${{ inputs.project_type == 'native' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" -maxdepth 3 -name sdkmanager -type f | sort -V | tail -n 1)
+          [ -n "$SDKMANAGER" ] || { echo "sdkmanager not found under $ANDROID_HOME/cmdline-tools"; exit 1; }
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" "platforms;android-34" "build-tools;34.0.0" "platform-tools"
+
+      - name: Setup Gradle 8.2
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.2"
+
+      - name: Scaffold native project
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet pillow
+          python3 - <<'PY'
+          import os, re, shutil, sys, urllib.request
+          from pathlib import Path
+
+          build_id = os.environ["BUILD_ID"]
+          pkg = os.environ["PKG"]
+          app_name = os.environ["APP_NAME"]
+          vname = os.environ["VNAME"]
+          vcode = os.environ["VCODE"]
+          lang = os.environ["LANG"]
+          perms = [x.strip() for x in os.environ.get("PERMS", "").split(",") if x.strip()]
+          icon_url = os.environ.get("ICON_URL", "")
+
+          src_dir = Path("builds") / build_id
+          if not src_dir.is_dir():
+              print(f"ERROR: no project files found at builds/{build_id}")
+              sys.exit(1)
+          all_files = [p for p in src_dir.rglob("*") if p.is_file()]
+          print("Project files:", [str(p.relative_to(src_dir)) for p in all_files])
+
+          sources = [p for p in all_files if p.suffix in (".kt", ".java")]
+          if not sources:
+              print("ERROR: a native project needs at least one .kt or .java source file")
+              sys.exit(1)
+
+          work = Path("work")
+          app = work / "app"
+          pkg_path = pkg.replace(".", "/")
+          java_dir = app / "src/main/java" / pkg_path
+          java_dir.mkdir(parents=True, exist_ok=True)
+          res_dir = app / "src/main/res"
+          (res_dir / "values").mkdir(parents=True, exist_ok=True)
+
+          # --- sources (flattened into the package folder) ---
+          seen = set()
+          for s in sources:
+              if s.name in seen:
+                  print("WARN: duplicate source name skipped:", s.name)
+                  continue
+              seen.add(s.name)
+              shutil.copy(s, java_dir / s.name)
+
+          # --- extra res/ files the project shipped (layouts, drawables...) ---
+          for p in all_files:
+              rel = p.relative_to(src_dir)
+              parts = rel.parts
+              if "res" in parts:
+                  idx = parts.index("res")
+                  dest = res_dir.joinpath(*parts[idx + 1:])
+                  dest.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copy(p, dest)
+
+          # --- detect the launcher activity class ---
+          main_cls = None
+          act_re = re.compile(r"class\s+(\w+)\s*:\s*(?:[\w.]+\.)?(AppCompatActivity|ComponentActivity|Activity)\s*\(")
+          java_act_re = re.compile(r"class\s+(\w+)\s+extends\s+(?:[\w.]+\.)?(AppCompatActivity|ComponentActivity|Activity)\b")
+          for s in sources:
+              text = s.read_text(errors="ignore")
+              m = act_re.search(text) or java_act_re.search(text)
+              if m:
+                  main_cls = m.group(1)
+                  break
+          if not main_cls:
+              for s in sources:
+                  if s.stem == "MainActivity":
+                      main_cls = "MainActivity"
+                      break
+          if not main_cls:
+              m = re.search(r"class\s+(\w+)", sources[0].read_text(errors="ignore"))
+              main_cls = m.group(1) if m else "MainActivity"
+          print("Launcher activity:", main_cls)
+
+          # --- AndroidManifest.xml ---
+          manifest_src = None
+          for p in all_files:
+              if p.name == "AndroidManifest.xml":
+                  manifest_src = p
+                  break
+          if manifest_src is not None:
+              text = manifest_src.read_text()
+              # AGP 8 takes the package from the Gradle namespace instead.
+              text = re.sub(r'\s+package="[^"]*"', "", text, count=1)
+              (app / "src/main/AndroidManifest.xml").write_text(text)
+              print("Using the project's own AndroidManifest.xml")
+          else:
+              perm_lines = "".join(f'    <uses-permission android:name="{x}" />\n' for x in perms)
+              manifest = f'''<?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+          {perm_lines}    <application
+                  android:label="@string/app_name"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher_round"
+                  android:theme="@style/AppTheme"
+                  android:allowBackup="true"
+                  android:supportsRtl="true">
+                  <activity
+                      android:name=".{main_cls}"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          '''
+              (app / "src/main/AndroidManifest.xml").write_text(manifest)
+
+          # --- resources ---
+          esc = app_name.replace("&", "&amp;").replace("<", "&lt;").replace('"', "&quot;")
+          (res_dir / "values/strings.xml").write_text(
+              '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n'
+              f'    <string name="app_name">{esc}</string>\n</resources>\n')
+          (res_dir / "values/themes.xml").write_text(
+              '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n'
+              '    <style name="AppTheme" parent="Theme.AppCompat.Light.NoActionBar" />\n</resources>\n')
+
+          # --- launcher icons ---
+          from PIL import Image
+          sizes = {"mdpi": 48, "hdpi": 72, "xhdpi": 96, "xxhdpi": 144, "xxxhdpi": 192}
+          if icon_url:
+              urllib.request.urlretrieve(icon_url, "/tmp/icon.png")
+              src_img = Image.open("/tmp/icon.png").convert("RGBA")
+          else:
+              src_img = Image.new("RGBA", (512, 512), (37, 99, 235, 255))
+          for dpi, px in sizes.items():
+              d = res_dir / f"mipmap-{dpi}"
+              d.mkdir(parents=True, exist_ok=True)
+              img = src_img.resize((px, px))
+              img.save(d / "ic_launcher.png")
+              img.save(d / "ic_launcher_round.png")
+
+          # --- Gradle files ---
+          (work / "settings.gradle").write_text(
+              "rootProject.name = 'app'\ninclude ':app'\n")
+          (work / "gradle.properties").write_text(
+              "android.useAndroidX=true\nandroid.nonTransitiveRClass=true\n"
+              "kotlin.code.style=official\norg.gradle.jvmargs=-Xmx2g\n")
+          (work / "build.gradle").write_text('''// Top-level build file (AR APK BUILD native scaffold)
+          buildscript {
+              repositories { google(); mavenCentral() }
+              dependencies {
+                  classpath 'com.android.tools.build:gradle:8.2.2'
+                  classpath 'org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.22'
+              }
+          }
+          allprojects { repositories { google(); mavenCentral() } }
+          tasks.register('clean', Delete) { delete rootProject.buildDir }
+          ''')
+          kotlin_plugin = "apply plugin: 'kotlin-android'\n" if lang == "kotlin" else ""
+          kotlin_options = ("    kotlinOptions { jvmTarget = '17' }\n" if lang == "kotlin" else "")
+          kotlin_deps = "    implementation 'androidx.core:core-ktx:1.12.0'\n" if lang == "kotlin" else ""
+          (app / "build.gradle").write_text(f'''apply plugin: 'com.android.application'
+          {kotlin_plugin}android {{
+              namespace '{pkg}'
+              compileSdk 34
+              defaultConfig {{
+                  applicationId '{pkg}'
+                  minSdk 24
+                  targetSdk 34
+                  versionCode {vcode}
+                  versionName '{vname}'
+              }}
+              signingConfigs {{
+                  release {{
+                      storeFile file('release.keystore')
+                      storePassword System.getenv('KEYSTORE_PASSWORD')
+                      keyAlias System.getenv('KEY_ALIAS')
+                      keyPassword System.getenv('KEY_PASSWORD')
+                  }}
+              }}
+              buildTypes {{
+                  release {{
+                      signingConfig signingConfigs.release
+                      minifyEnabled false
+                  }}
+              }}
+              compileOptions {{
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }}
+          {kotlin_options}}}
+          dependencies {{
+              implementation 'androidx.appcompat:appcompat:1.6.1'
+          {kotlin_deps}}}
+          ''')
+          print("Native scaffold ready:", pkg, lang, "activity", main_cls)
+          PY
+        env:
+          BUILD_ID: ${{ inputs.build_id }}
+          PKG: ${{ inputs.package_name }}
+          APP_NAME: ${{ inputs.app_name }}
+          VNAME: ${{ inputs.version_name }}
+          VCODE: ${{ inputs.version_code }}
+          LANG: ${{ inputs.language }}
+          PERMS: ${{ inputs.permissions }}
+          ICON_URL: ${{ inputs.icon_url }}
+
+      - name: Decode release keystore
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s' "${{ secrets.KEYSTORE_BASE64 }}" | tr -d '[:space:]' | base64 -d > work/app/release.keystore
+          keytool -list -keystore work/app/release.keystore -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" >/dev/null
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+
+      - name: Build release APK (native)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd work
+          gradle wrapper --gradle-version 8.2 --distribution-type bin
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon
+          cp app/build/outputs/apk/release/app-release.apk "$GITHUB_WORKSPACE/app-release-${{ inputs.build_id }}.apk"
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -maxdepth 2 -name apksigner -type f | sort -V | tail -n 1)
+          [ -n "$APKSIGNER" ] || { echo "apksigner not found under $ANDROID_HOME/build-tools"; exit 1; }
+          "$APKSIGNER" verify --print-certs "$GITHUB_WORKSPACE/app-release-${{ inputs.build_id }}.apk" | head -5
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-${{ inputs.build_id }}
+          path: app-release-${{ inputs.build_id }}.apk
+          retention-days: 7
+
+      - name: Clean up delivered project files
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request, urllib.error
+          repo = os.environ["GITHUB_REPOSITORY"]
+          token = os.environ["GH_TOKEN"]
+          build_id = os.environ["BUILD_ID"]
+          def api(method, path, payload=None):
+              req = urllib.request.Request(
+                  "https://api.github.com" + path,
+                  method=method,
+                  data=json.dumps(payload).encode() if payload is not None else None,
+                  headers={"Authorization": "Bearer " + token,
+                           "Accept": "application/vnd.github+json",
+                           "Content-Type": "application/json",
+                           "User-Agent": "ar-apk-build-cleanup"})
+              try:
+                  with urllib.request.urlopen(req) as r:
+                      body = r.read().decode()
+                      return json.loads(body) if body else {}
+              except urllib.error.HTTPError as e:
+                  if e.code == 404:
+                      return None
+                  raise
+          def delete_tree(path):
+              items = api("GET", f"/repos/{repo}/contents/{path}?ref=main")
+              if items is None:
+                  return
+              for it in items:
+                  if it["type"] == "dir":
+                      delete_tree(it["path"])
+                  else:
+                      api("DELETE", f"/repos/{repo}/contents/{it['path']}",
+                          {"message": f"cleanup build files {build_id}", "sha": it["sha"]})
+          delete_tree(f"builds/{build_id}")
+          print("cleanup done")
+          PY
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_ID: ${{ inputs.build_id }}
