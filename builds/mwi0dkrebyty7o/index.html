@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>Worm Arena — Sweet Battle</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game"></canvas>
+
+  <!-- In-game HUD -->
+  <div id="hud" class="hidden">
+    <div id="board">
+      <div class="boardTitle">🏆 Top Players</div>
+      <ol id="boardList"></ol>
+    </div>
+    <div id="statsBox">
+      <div class="pill" id="coinPill">🪙 0</div>
+      <div class="pill" id="lenPill">📏 0</div>
+      <div class="pill" id="timePill">⏱ 0:00</div>
+      <div class="hudBtns">
+        <button class="iconBtn" id="btnMute" aria-label="Sound">🔊</button>
+        <button class="iconBtn" id="btnPause" aria-label="Pause">⏸</button>
+      </div>
+      <div id="fxBox"></div>
+    </div>
+  </div>
+
+  <div id="toast" class="hidden"></div>
+
+  <!-- Touch controls -->
+  <div id="joyBase" class="hidden"><div id="joyKnob"></div></div>
+  <button id="boostBtn" class="hidden">⚡<span>BOOST</span></button>
+
+  <!-- Main menu -->
+  <div class="overlay" id="menu">
+    <div class="card">
+      <svg id="mascot" viewBox="0 0 220 90" aria-hidden="true">
+        <circle cx="30" cy="58" r="17" fill="#22c55e"/><circle cx="58" cy="50" r="19" fill="#4ade80"/>
+        <circle cx="89" cy="45" r="21" fill="#22c55e"/><circle cx="122" cy="42" r="23" fill="#4ade80"/>
+        <circle cx="160" cy="42" r="26" fill="#22c55e"/>
+        <circle cx="152" cy="34" r="7.5" fill="#fff"/><circle cx="172" cy="34" r="7.5" fill="#fff"/>
+        <circle cx="153" cy="36" r="3.6" fill="#1f2937"/><circle cx="173" cy="36" r="3.6" fill="#1f2937"/>
+        <path d="M152 52 Q163 60 174 52" stroke="#14532d" stroke-width="3.5" fill="none" stroke-linecap="round"/>
+        <circle cx="146" cy="47" r="4" fill="#fda4af" opacity=".7"/><circle cx="180" cy="47" r="4" fill="#fda4af" opacity=".7"/>
+      </svg>
+      <h1>WORM <span>ARENA</span></h1>
+      <p class="tag">Sweet Battle</p>
+      <input id="nameInput" type="text" maxlength="12" placeholder="Your name" autocomplete="off">
+      <p class="lbl">Choose your skin</p>
+      <div id="skins"></div>
+      <button class="bigBtn" id="btnPlay">▶ &nbsp;Play</button>
+      <p class="bestLine" id="menuBest">🏆 Best: 0</p>
+      <button class="linkBtn" id="btnHow">How to play ❓</button>
+      <div class="how hidden" id="howCard">
+        <p>🕹️ <b>Steer</b> with the joystick (left thumb), mouse, or WASD / arrow keys.</p>
+        <p>⚡ <b>Boost</b>: hold the BOOST button or Space — it's fast, but it burns your length!</p>
+        <p>🍬 Eat sweets to grow. Bigger worms drop glowing orbs when they die — grab them!</p>
+        <p>💀 You die if your head hits another worm's body — or the red arena border.</p>
+        <p>🧲 Magnet pulls food to you • ⭐ Star = double coins for a while.</p>
+        <p>❤️ One free Second Chance revive per game.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Pause -->
+  <div class="overlay hidden" id="pauseMenu">
+    <div class="card small">
+      <h2>⏸ Paused</h2>
+      <button class="bigBtn" id="btnResume">▶ &nbsp;Resume</button>
+      <button class="midBtn" id="btnRestart">↻ &nbsp;Restart</button>
+      <button class="midBtn" id="btnQuit">🏠 &nbsp;Main Menu</button>
+    </div>
+  </div>
+
+  <!-- Game over -->
+  <div class="overlay hidden" id="over">
+    <div class="card small">
+      <div class="logo">💀</div>
+      <h2>Game Over!</h2>
+      <p class="killedBy" id="killedBy"></p>
+      <div class="statGrid">
+        <div><b id="stScore">0</b><span>Coins</span></div>
+        <div><b id="stLen">0</b><span>Length</span></div>
+        <div><b id="stKills">0</b><span>Kills</span></div>
+        <div><b id="stTime">0:00</b><span>Time</span></div>
+      </div>
+      <p class="bestLine" id="finalBest">🏆 Best: 0</p>
+      <button class="bigBtn pink" id="btnRevive">❤️ &nbsp;Second Chance</button>
+      <button class="bigBtn" id="btnAgain">↻ &nbsp;Play Again</button>
+      <button class="midBtn" id="btnMenu2">🏠 &nbsp;Main Menu</button>
+    </div>
+  </div>
+</div>
+<script src="js/game.js"></script>
+</body>
+</html>
