@@ -207,12 +207,18 @@ jobs:
                   }
               }
           '''
+          # Insert the signingConfigs block just before buildTypes, then
+          # attach it to the release build type — searching ONLY inside the
+          # buildTypes section. (Searching the whole file is a bug: the
+          # first "release {" in the file is the one inside the freshly
+          # inserted signingConfigs block itself, which produced the Gradle
+          # error "Could not find method signingConfig() ... on SigningConfig".)
+          assert "    buildTypes {" in t
           t = t.replace("    buildTypes {", signing + "    buildTypes {", 1)
-          t = t.replace("            // release signing is injected by CI",
-                        "            signingConfig signingConfigs.release")
-          # Fallback: attach signingConfig inside the release block if marker differs.
-          if "signingConfigs.release" not in t.split("buildTypes",1)[1]:
-              t = t.replace("        release {", "        release {\n            signingConfig signingConfigs.release", 1)
+          head, sep, tail = t.partition("    buildTypes {")
+          assert "release {" in tail
+          tail = tail.replace("release {", "release {\n            signingConfig signingConfigs.release", 1)
+          t = head + sep + tail
           g.write_text(t)
           PY
         env:
