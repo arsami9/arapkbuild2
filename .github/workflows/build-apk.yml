@@ -75,8 +75,18 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          # ubuntu-latest runners already ship an Android SDK ($ANDROID_HOME).
+          # android-actions/setup-android@v3 is NOT used: it tries to install
+          # the legacy "tools" package, which current SDK repos no longer
+          # carry ("Failed to find package 'tools'"). Install directly instead.
+          SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" -maxdepth 3 -name sdkmanager -type f | sort -V | tail -n 1)
+          [ -n "$SDKMANAGER" ] || { echo "sdkmanager not found under $ANDROID_HOME/cmdline-tools"; exit 1; }
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" "platforms;android-34" "build-tools;34.0.0" "platform-tools"
 
       - name: Scaffold Capacitor project
         shell: bash
