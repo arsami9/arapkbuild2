@@ -1,0 +1,1 @@
+document.body.insertAdjacentHTML('beforeend','<p>JS works</p>');
