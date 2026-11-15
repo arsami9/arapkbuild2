@@ -1,0 +1,84 @@
+/* Snake 3D — Cartoon Adventure */
+* { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+html, body {
+  width: 100%; height: 100%; overflow: hidden; background: #79c7f2;
+  font-family: "Baloo 2", "Comic Sans MS", "Chalkboard SE", "Segoe UI", Verdana, sans-serif;
+  touch-action: none; overscroll-behavior: none;
+  -webkit-user-select: none; user-select: none;
+  position: fixed; inset: 0;
+}
+#wrap { position: absolute; inset: 0; }
+canvas#game { display: block; width: 100%; height: 100%; }
+
+/* ---------- HUD ---------- */
+#hud {
+  position: absolute; top: calc(8px + env(safe-area-inset-top)); left: 10px; right: 10px;
+  display: flex; align-items: center; gap: 8px; pointer-events: none; z-index: 5;
+}
+.pill {
+  background: rgba(255,255,255,.88); color: #14532d; font-weight: 800; font-size: 16px;
+  padding: 6px 14px; border-radius: 999px; box-shadow: 0 3px 10px rgba(20,60,30,.25);
+  border: 2px solid rgba(255,255,255,.9); white-space: nowrap;
+}
+.hudBtns { margin-left: auto; display: flex; gap: 8px; pointer-events: auto; }
+.iconBtn {
+  width: 42px; height: 42px; border-radius: 50%; border: 2px solid rgba(255,255,255,.9);
+  background: rgba(255,255,255,.88); font-size: 19px; cursor: pointer;
+  box-shadow: 0 3px 10px rgba(20,60,30,.25); display: flex; align-items: center; justify-content: center;
+}
+.iconBtn:active { transform: scale(.92); }
+
+/* ---------- Overlays ---------- */
+.overlay {
+  position: absolute; inset: 0; z-index: 10; display: flex; align-items: center; justify-content: center;
+  background: rgba(10, 40, 25, .38); backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px);
+  padding: 18px;
+}
+.hidden { display: none !important; }
+.card {
+  background: linear-gradient(180deg, #ffffff, #eefbe9); border-radius: 28px;
+  padding: 26px 26px 22px; text-align: center; max-width: 340px; width: 100%;
+  box-shadow: 0 18px 50px rgba(0,40,20,.45), inset 0 2px 0 #fff;
+  border: 3px solid #b8e986; animation: pop .35s ease;
+}
+@keyframes pop { from { transform: scale(.85); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+.logo { font-size: 54px; line-height: 1; animation: bob 1.6s ease-in-out infinite; }
+@keyframes bob { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-7px); } }
+.card h1 {
+  font-size: 44px; font-weight: 900; letter-spacing: 1px; margin-top: 4px;
+  background: linear-gradient(180deg, #39d353, #1d7a38); -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+.card h1 span { background: linear-gradient(180deg, #ffb340, #f97316); -webkit-background-clip: text; background-clip: text; color: transparent; }
+.card h2 { font-size: 32px; font-weight: 900; color: #dc2626; margin-top: 2px; }
+.tag { color: #f97316; font-weight: 800; letter-spacing: 3px; text-transform: uppercase; font-size: 12px; margin-top: -2px; }
+.desc { color: #3f6212; font-size: 15px; margin: 12px 0 16px; line-height: 1.45; }
+.bigBtn {
+  background: linear-gradient(180deg, #4ade80, #16a34a); color: #fff; border: none; cursor: pointer;
+  font-family: inherit; font-size: 21px; font-weight: 900; letter-spacing: .5px;
+  padding: 13px 42px; border-radius: 999px; box-shadow: 0 6px 0 #15803d, 0 12px 24px rgba(21,128,61,.4);
+  transition: transform .08s, box-shadow .08s;
+}
+.bigBtn:active { transform: translateY(4px); box-shadow: 0 2px 0 #15803d, 0 6px 12px rgba(21,128,61,.4); }
+.bestLine { color: #92400e; font-weight: 800; margin-top: 14px; font-size: 15px; }
+.finalScore { font-size: 22px; font-weight: 900; color: #14532d; margin-top: 8px; }
+.how { margin-top: 14px; border-top: 2px dashed #c9e7b8; padding-top: 12px; }
+.how p { color: #527a2e; font-size: 13.5px; line-height: 1.7; }
+
+#pausedTag {
+  position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 6;
+  background: rgba(20, 40, 25, .75); color: #fff; font-size: 22px; font-weight: 900;
+  padding: 12px 30px; border-radius: 999px; letter-spacing: 1px; pointer-events: none;
+}
+
+/* ---------- Direction pad ---------- */
+#dpad {
+  position: absolute; right: 14px; bottom: calc(16px + env(safe-area-inset-bottom)); z-index: 5;
+  display: none; grid-template-columns: repeat(3, 52px); grid-template-rows: repeat(2, 52px); gap: 6px;
+}
+@media (pointer: coarse) { #dpad { display: grid; } }
+.padBtn {
+  border-radius: 16px; border: 2px solid rgba(255,255,255,.65);
+  background: rgba(20, 60, 35, .42); color: #fff; font-size: 19px; cursor: pointer;
+  display: flex; align-items: center; justify-content: center; backdrop-filter: blur(2px);
+}
+.padBtn:active { background: rgba(46, 160, 67, .75); transform: scale(.93); }
