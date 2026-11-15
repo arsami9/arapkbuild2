@@ -416,6 +416,27 @@ jobs:
                   dest.parent.mkdir(parents=True, exist_ok=True)
                   shutil.copy(p, dest)
 
+          # --- everything else the project shipped becomes app assets ---
+          # (e.g. a www/ web root served through WebViewAssetLoader, keeping
+          #  the project's own folder structure under assets/)
+          assets_dir = app / "src/main/assets"
+          skip_names = {"AndroidManifest.xml", "settings.gradle", "gradle.properties",
+                        "build.gradle", ".gitignore"}
+          for p in all_files:
+              rel = p.relative_to(src_dir)
+              parts = rel.parts
+              if p.suffix in (".kt", ".java"):
+                  continue
+              if "res" in parts or p.name in skip_names:
+                  continue
+              if parts[0] == "assets" and len(parts) > 1:
+                  rel = Path(*parts[1:])
+              dest = assets_dir / rel
+              dest.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copy(p, dest)
+          if assets_dir.is_dir():
+              print("Assets bundled:", sorted(str(p.relative_to(assets_dir)) for p in assets_dir.rglob("*") if p.is_file()))
+
           # --- detect the launcher activity class ---
           main_cls = None
           act_re = re.compile(r"class\s+(\w+)\s*:\s*(?:[\w.]+\.)?(AppCompatActivity|ComponentActivity|Activity)\s*\(")
@@ -436,6 +457,19 @@ jobs:
               main_cls = m.group(1) if m else "MainActivity"
           print("Launcher activity:", main_cls)
 
+          # --- permissions the code itself asks for (Manifest.permission.X) ---
+          for s in sources:
+              text = s.read_text(errors="ignore")
+              for m in re.finditer(r"Manifest\.permission\.([A-Z_]+)", text):
+                  p = "android.permission." + m.group(1)
+                  if p not in perms:
+                      perms.append(p)
+              for m in re.finditer(r'"android\.permission\.([A-Z_]+)"', text):
+                  p = "android.permission." + m.group(1)
+                  if p not in perms:
+                      perms.append(p)
+          print("Manifest permissions:", perms)
+
           # --- AndroidManifest.xml ---
           manifest_src = None
           for p in all_files:
@@ -449,7 +483,10 @@ jobs:
               (app / "src/main/AndroidManifest.xml").write_text(text)
               print("Using the project's own AndroidManifest.xml")
           else:
-              perm_lines = "".join(f'    <uses-permission android:name="{x}" />\n' for x in perms)
+              def perm_tag(x):
+                  extra = ' android:maxSdkVersion="28"' if x == "android.permission.WRITE_EXTERNAL_STORAGE" else ""
+                  return f'    <uses-permission android:name="{x}"{extra} />\n'
+              perm_lines = "".join(perm_tag(x) for x in perms)
               manifest = f'''<?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
           {perm_lines}    <application
@@ -516,6 +553,11 @@ jobs:
           kotlin_plugin = "apply plugin: 'kotlin-android'\n" if lang == "kotlin" else ""
           kotlin_options = ("    kotlinOptions { jvmTarget = '17' }\n" if lang == "kotlin" else "")
           kotlin_deps = "    implementation 'androidx.core:core-ktx:1.12.0'\n" if lang == "kotlin" else ""
+          dep_map = {"androidx.webkit.": "    implementation 'androidx.webkit:webkit:1.8.0'\n"}
+          all_src = "\n".join(s.read_text(errors="ignore") for s in sources)
+          extra_deps = "".join(dep for prefix, dep in dep_map.items() if prefix in all_src)
+          if extra_deps:
+              print("Extra dependencies added:", extra_deps.strip())
           (app / "build.gradle").write_text(f'''apply plugin: 'com.android.application'
           {kotlin_plugin}android {{
               namespace '{pkg}'
@@ -548,7 +590,7 @@ jobs:
           {kotlin_options}}}
           dependencies {{
               implementation 'androidx.appcompat:appcompat:1.6.1'
-          {kotlin_deps}}}
+          {kotlin_deps}{extra_deps}}}
           ''')
           print("Native scaffold ready:", pkg, lang, "activity", main_cls)
           PY
