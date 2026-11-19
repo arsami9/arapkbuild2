@@ -1,0 +1,13 @@
+{
+  "_note": "Replace host/port/username/password with your own proxies. type is SOCKS5 or HTTP. premium=false shows under the Free tab.",
+  "servers": [
+    { "id": "us-denver",  "country": "United States", "code": "US", "city": "Denver",  "host": "us1.example-proxy.net", "port": 1080, "type": "SOCKS5", "username": "user", "password": "pass", "premium": true },
+    { "id": "us-boston",  "country": "United States", "code": "US", "city": "Boston",  "host": "us2.example-proxy.net", "port": 1080, "type": "SOCKS5", "username": "user", "password": "pass", "premium": true },
+    { "id": "us-mcallen", "country": "United States", "code": "US", "city": "McAllen", "host": "us3.example-proxy.net", "port": 1080, "type": "SOCKS5", "username": "user", "password": "pass", "premium": false },
+    { "id": "bd-dhaka",   "country": "Bangladesh",    "code": "BD", "city": "Dhaka",   "host": "bd1.example-proxy.net", "port": 1080, "type": "SOCKS5", "username": "user", "password": "pass", "premium": true },
+    { "id": "tw-taipei",  "country": "Taiwan",        "code": "TW", "city": "Taipei",  "host": "tw1.example-proxy.net", "port": 1080, "type": "SOCKS5", "username": "user", "password": "pass", "premium": true },
+    { "id": "nz-auckland","country": "New Zealand",   "code": "NZ", "city": "Auckland","host": "nz1.example-proxy.net", "port": 1080, "type": "SOCKS5", "username": "user", "password": "pass", "premium": true },
+    { "id": "tr-istanbul","country": "Turkey",        "code": "TR", "city": "Istanbul","host": "tr1.example-proxy.net", "port": 1080, "type": "HTTP",   "username": "user", "password": "pass", "premium": true },
+    { "id": "eg-cairo",   "country": "Egypt",         "code": "EG", "city": "Cairo",   "host": "eg1.example-proxy.net", "port": 1080, "type": "SOCKS5", "username": "user", "password": "pass", "premium": true }
+  ]
+}
