@@ -107,6 +107,12 @@ jobs:
           [ -n "$SDKMANAGER" ] || { echo "sdkmanager not found under $ANDROID_HOME/cmdline-tools"; exit 1; }
           yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
           "$SDKMANAGER" "platforms;android-34" "build-tools;34.0.0" "platform-tools"
+          # Target SDK chosen in the build form (default 34): its platform
+          # and build-tools must exist before Gradle configures the project.
+          TGT=$(python3 -c "import json;print(json.load(open('$GITHUB_WORKSPACE/builds/$BUILD_ID/__config.json')).get('targetSdk',34))" 2>/dev/null || echo 34)
+          if [ "$TGT" != "34" ]; then "$SDKMANAGER" "platforms;android-$TGT" "build-tools;$TGT.0.0"; fi
+        env:
+          BUILD_ID: ${{ inputs.build_id }}
 
       - name: Scaffold Capacitor project
         shell: bash
@@ -133,6 +139,34 @@ jobs:
             [ -f web/index.html ] || { echo "ERROR: an HTML/CSS/JS project needs an index.html file"; exit 1; }
             echo "Bundled project files:"; find web -type f | head -50
           fi
+          # Custom CSS/JS from the build form are injected into the bundled
+          # index.html (html/blank types). Reserved Worker files (__*) never
+          # ship inside the app.
+          python3 - <<'PY'
+          import os, pathlib
+          builds = pathlib.Path(os.environ["BUILDS_DIR"])
+          web = pathlib.Path("web")
+          css = ""
+          js = ""
+          if (builds / "__custom.css").exists():
+              css = (builds / "__custom.css").read_text()
+          if (builds / "__custom.js").exists():
+              js = (builds / "__custom.js").read_text()
+          idx = web / "index.html"
+          if idx.exists() and (css or js):
+              h = idx.read_text(errors="ignore")
+              if css:
+                  tag = "<style data-arapk>\n" + css.replace("</style", "<\\/style") + "\n</style>"
+                  h = h.replace("</head>", tag + "</head>", 1) if "</head>" in h else tag + h
+              if js:
+                  tag = "<script data-arapk>\n" + js.replace("</script", "<\\/script") + "\n</script>"
+                  h = h.replace("</body>", tag + "</body>", 1) if "</body>" in h else h + tag
+              idx.write_text(h)
+              print("Injected custom CSS/JS into index.html")
+          for f in web.glob("__*"):
+              if f.is_file():
+                  f.unlink()
+          PY
           # capacitor.config.json is generated from dispatch inputs. The
           # Website URL is OPTIONAL: server.url is set only when one was
           # given; otherwise the app serves the bundled web files.
@@ -146,6 +180,10 @@ jobs:
             if (process.env.START_URL) {
               cfg.server = { url: process.env.START_URL, cleartext: false, androidScheme: "https" };
             }
+            try {
+              const bc = JSON.parse(fs.readFileSync(process.env.CFG_PATH, "utf8"));
+              if (bc.userAgent) cfg.overrideUserAgent = bc.userAgent;
+            } catch (e) {}
             fs.writeFileSync("capacitor.config.json", JSON.stringify(cfg, null, 2));
           '
           npx cap add android
@@ -156,6 +194,8 @@ jobs:
           START_URL: ${{ inputs.start_url }}
           PTYPE: ${{ inputs.project_type }}
           BUILD_ID: ${{ inputs.build_id }}
+          BUILDS_DIR: ${{ github.workspace }}/builds/${{ inputs.build_id }}
+          CFG_PATH: ${{ github.workspace }}/builds/${{ inputs.build_id }}/__config.json
 
       - name: Apply name, version, permissions, icon
         shell: bash
@@ -190,9 +230,14 @@ jobs:
           p.write_text(s)
           PY
           fi
-          # Optional custom icon (1024x1024 PNG) -> regenerate mipmap set
-          if [ -n "${{ inputs.icon_url }}" ]; then
-            curl -fsSL "${{ inputs.icon_url }}" -o /tmp/icon.png
+          # Optional custom icon -> regenerate mipmap set. An icon uploaded
+          # in the build form (committed by the Worker as __icon.img) wins
+          # over the icon URL.
+          ICON_SRC=""
+          if [ -f "$BUILDS_DIR/__icon.img" ]; then ICON_SRC="$BUILDS_DIR/__icon.img";
+          elif [ -n "${{ inputs.icon_url }}" ]; then curl -fsSL "${{ inputs.icon_url }}" -o /tmp/icon.png; ICON_SRC=/tmp/icon.png; fi
+          if [ -n "$ICON_SRC" ]; then
+            cp "$ICON_SRC" /tmp/icon.png
             # Pillow is NOT preinstalled on ubuntu-latest runners — without
             # this the icon step fails with "ModuleNotFoundError: PIL".
             python3 -m pip install --quiet pillow
@@ -211,23 +256,246 @@ jobs:
               src.resize((px, px)).save(fg)
           PY
           fi
+          # SDK levels + orientation from the build form (__config.json).
+          python3 - <<'PY'
+          import json, os, pathlib, re
+          cfg = {}
+          cp = pathlib.Path(os.environ["CFG_PATH"])
+          if cp.exists():
+              cfg = json.loads(cp.read_text())
+          min_sdk = max(22, int(cfg.get("minSdk", 22)))
+          target_sdk = int(cfg.get("targetSdk", 34))
+          v = pathlib.Path("android/variables.gradle")
+          if v.exists():
+              t = v.read_text()
+              t = re.sub(r"minSdkVersion\s*=\s*\d+", "minSdkVersion = %d" % min_sdk, t)
+              t = re.sub(r"compileSdkVersion\s*=\s*\d+", "compileSdkVersion = %d" % target_sdk, t)
+              t = re.sub(r"targetSdkVersion\s*=\s*\d+", "targetSdkVersion = %d" % target_sdk, t)
+              v.write_text(t)
+          print("SDK levels: min", min_sdk, "target", target_sdk)
+          orient = cfg.get("orientation", "auto")
+          if orient in ("portrait", "landscape"):
+              mp = pathlib.Path("android/app/src/main/AndroidManifest.xml")
+              s = mp.read_text()
+              def add_attr(m):
+                  tag = m.group(0)
+                  if "screenOrientation" in tag:
+                      return tag
+                  return tag.replace("<activity", '<activity android:screenOrientation="' + orient + '"', 1)
+              s2 = re.sub(r"<activity\b[^>]*>", add_attr, s, count=1)
+              if s2 != s:
+                  mp.write_text(s2)
+                  print("Orientation locked:", orient)
+          PY
+          # Splash screen image -> the density set Capacitor's launch theme
+          # reads (res/drawable-*/splash.png).
+          if [ -f "$BUILDS_DIR/__splash.img" ]; then
+            python3 -m pip install --quiet pillow
+            python3 - <<'PY'
+          import os, pathlib
+          from PIL import Image
+          src = Image.open(pathlib.Path(os.environ["BUILDS_DIR"]) / "__splash.img").convert("RGB")
+          res = pathlib.Path("android/app/src/main/res")
+          def crop_resize(img, w, h):
+              s = max(w / img.width, h / img.height)
+              im = img.resize((max(1, round(img.width * s)), max(1, round(img.height * s))))
+              x = (im.width - w) // 2
+              y = (im.height - h) // 2
+              return im.crop((x, y, x + w, y + h))
+          for dpi, s in {"mdpi": 1, "hdpi": 1.5, "xhdpi": 2, "xxhdpi": 3, "xxxhdpi": 4}.items():
+              for o, (bw, bh) in (("port", (320, 480)), ("land", (480, 320))):
+                  d = res / ("drawable-" + o + "-" + dpi)
+                  d.mkdir(parents=True, exist_ok=True)
+                  crop_resize(src, round(bw * s), round(bh * s)).save(d / "splash.png")
+          (res / "drawable").mkdir(parents=True, exist_ok=True)
+          crop_resize(src, 480, 800).save(res / "drawable" / "splash.png")
+          print("Splash screen images generated")
+          PY
+          fi
+          # MainActivity: status-bar color, WebView behavior toggles and the
+          # Share/Rate bridge, generated from __config.json.
+          python3 - <<'PY'
+          import json, os, pathlib
+          cfg = {}
+          cp = pathlib.Path(os.environ["CFG_PATH"])
+          if cp.exists():
+              cfg = json.loads(cp.read_text())
+          beh = cfg.get("behavior") or {}
+          color = cfg.get("statusColor") or ""
+          share_msg = cfg.get("shareMessage") or ""
+          share_link = cfg.get("shareLink") or ""
+          if not (color or share_msg or any(beh.values())):
+              print("No MainActivity customization requested")
+              raise SystemExit(0)
+          pkg = os.environ["PKG"]
+          def jstr(s):
+              return '"' + s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ").replace("\r", " ") + '"'
+          imports = {"android.os.Bundle", "com.getcapacitor.BridgeActivity"}
+          body = []
+          body.append("    @Override")
+          body.append("    public void onCreate(Bundle savedInstanceState) {")
+          body.append("        super.onCreate(savedInstanceState);")
+          body.append("        try {")
+          if color:
+              imports.add("android.graphics.Color")
+              body.append('            getWindow().setStatusBarColor(Color.parseColor(' + jstr(color) + "));")
+          if beh.get("fullscreen"):
+              imports.add("android.view.WindowManager")
+              body.append("            getWindow().addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);")
+          body.append("            final android.webkit.WebView web = (getBridge() != null) ? getBridge().getWebView() : null;")
+          body.append("            if (web != null) {")
+          if beh.get("pinchZoom"):
+              body.append("                web.getSettings().setSupportZoom(true);")
+              body.append("                web.getSettings().setBuiltInZoomControls(true);")
+              body.append("                web.getSettings().setDisplayZoomControls(false);")
+          else:
+              body.append("                web.getSettings().setSupportZoom(false);")
+              body.append("                web.getSettings().setBuiltInZoomControls(false);")
+          if beh.get("autoplay"):
+              body.append("                web.getSettings().setMediaPlaybackRequiresUserGesture(false);")
+          if beh.get("pcMode"):
+              body.append('                web.getSettings().setUserAgentString("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");')
+          if not beh.get("longPress"):
+              body.append("                web.setLongClickable(false);")
+              body.append("                web.setOnLongClickListener(v -> true);")
+          if beh.get("darkMode"):
+              body.append("                if (android.os.Build.VERSION.SDK_INT >= 29) web.getSettings().setForceDark(android.webkit.WebSettings.FORCE_DARK_ON);")
+          if share_msg:
+              body.append('                web.addJavascriptInterface(new ShareBridge(this), "AndroidDownloader");')
+          if beh.get("spinner") or beh.get("pullRefresh"):
+              imports.update(["android.view.View", "android.view.ViewGroup"])
+              body.append("                android.view.ViewGroup parent = (android.view.ViewGroup) web.getParent();")
+              body.append("                if (parent != null) {")
+              body.append("                    int idx = parent.indexOfChild(web);")
+              body.append("                    parent.removeView(web);")
+              inner = "web"
+              if beh.get("pullRefresh"):
+                  imports.add("androidx.swiperefreshlayout.widget.SwipeRefreshLayout")
+                  body.append("                    androidx.swiperefreshlayout.widget.SwipeRefreshLayout srl = new androidx.swiperefreshlayout.widget.SwipeRefreshLayout(this);")
+                  body.append("                    srl.addView(web, new android.view.ViewGroup.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.MATCH_PARENT));")
+                  body.append("                    srl.setOnRefreshListener(() -> { web.reload(); srl.postDelayed(() -> srl.setRefreshing(false), 1500); });")
+                  inner = "srl"
+              if beh.get("spinner"):
+                  imports.update(["android.os.Handler", "android.os.Looper", "android.widget.FrameLayout", "android.widget.ProgressBar"])
+                  body.append("                    android.widget.FrameLayout fl = new android.widget.FrameLayout(this);")
+                  body.append("                    fl.addView(" + inner + ", new android.widget.FrameLayout.LayoutParams(android.widget.FrameLayout.LayoutParams.MATCH_PARENT, android.widget.FrameLayout.LayoutParams.MATCH_PARENT));")
+                  body.append("                    final android.widget.ProgressBar pb = new android.widget.ProgressBar(this);")
+                  body.append("                    android.widget.FrameLayout.LayoutParams plp = new android.widget.FrameLayout.LayoutParams(android.widget.FrameLayout.LayoutParams.WRAP_CONTENT, android.widget.FrameLayout.LayoutParams.WRAP_CONTENT);")
+                  body.append("                    plp.gravity = android.view.Gravity.CENTER;")
+                  body.append("                    fl.addView(pb, plp);")
+                  body.append("                    parent.addView(fl, idx, new android.view.ViewGroup.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.MATCH_PARENT));")
+                  body.append("                    final android.os.Handler hh = new android.os.Handler(android.os.Looper.getMainLooper());")
+                  body.append("                    final Object[] poll = new Object[1];")
+                  body.append("                    poll[0] = new Runnable() { public void run() { if (web.getProgress() < 100) { hh.postDelayed((Runnable) poll[0], 200); } else { pb.setVisibility(android.view.View.GONE); } } };")
+                  body.append("                    hh.postDelayed((Runnable) poll[0], 300);")
+                  inner = "fl"
+              if inner not in ("web", "fl"):
+                  body.append("                    parent.addView(" + inner + ", idx, new android.view.ViewGroup.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.MATCH_PARENT));")
+              body.append("                }")
+          body.append("            }")
+          body.append("        } catch (Exception e) { /* build-form customization is best-effort */ }")
+          if beh.get("exitConfirm"):
+              imports.update(["androidx.activity.OnBackPressedCallback", "android.widget.Toast"])
+              body.append("        getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {")
+              body.append("            private long lastPress = 0;")
+              body.append("            @Override public void handleOnBackPressed() {")
+              body.append("                long t = System.currentTimeMillis();")
+              body.append("                if (t - lastPress < 2000) { finish(); } else { lastPress = t; Toast.makeText(MainActivity.this, \"Press back again to exit\", Toast.LENGTH_SHORT).show(); }")
+              body.append("            }")
+              body.append("        });")
+          body.append("    }")
+          extra = ""
+          if share_msg:
+              imports.update(["android.content.Intent", "android.net.Uri"])
+              extra = (
+                  "\n    public static class ShareBridge {\n"
+                  "        private final MainActivity act;\n"
+                  "        private static final String MSG = " + jstr(share_msg) + ";\n"
+                  "        private static final String LINK = " + jstr(share_link) + ";\n"
+                  "        ShareBridge(MainActivity a) { this.act = a; }\n"
+                  "        @android.webkit.JavascriptInterface\n"
+                  "        public void shareApp() {\n"
+                  "            act.runOnUiThread(() -> {\n"
+                  "                Intent send = new Intent(Intent.ACTION_SEND);\n"
+                  "                send.setType(\"text/plain\");\n"
+                  "                send.putExtra(Intent.EXTRA_TEXT, LINK.isEmpty() ? MSG : MSG + \" \" + LINK);\n"
+                  "                act.startActivity(Intent.createChooser(send, \"Share via\"));\n"
+                  "            });\n"
+                  "        }\n"
+                  "        @android.webkit.JavascriptInterface\n"
+                  "        public void rateApp() {\n"
+                  "            act.runOnUiThread(() -> {\n"
+                  "                try { act.startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(\"market://details?id=\" + act.getPackageName()))); }\n"
+                  "                catch (Exception e) { act.startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(LINK.isEmpty() ? \"https://play.google.com/store/apps/details?id=\" + act.getPackageName() : LINK))); }\n"
+                  "            });\n"
+                  "        }\n"
+                  "    }\n"
+              )
+          if beh.get("pullRefresh"):
+              g = pathlib.Path("android/app/build.gradle")
+              t = g.read_text()
+              if "swiperefreshlayout" not in t:
+                  t = t.replace("dependencies {", "dependencies {\n    implementation 'androidx.swiperefreshlayout:swiperefreshlayout:1.1.0'", 1)
+                  g.write_text(t)
+          java = "package " + pkg + ";\n\n"
+          java += "".join("import " + i + ";\n" for i in sorted(imports))
+          java += "\npublic class MainActivity extends BridgeActivity {\n"
+          java += "\n".join(body) + "\n"
+          java += extra
+          java += "}\n"
+          dest = pathlib.Path("android/app/src/main/java/" + pkg.replace(".", "/") + "/MainActivity.java")
+          dest.parent.mkdir(parents=True, exist_ok=True)
+          dest.write_text(java)
+          print("MainActivity generated with build-form behavior")
+          PY
         env:
           APP_NAME: ${{ inputs.app_name }}
           VNAME: ${{ inputs.version_name }}
           VCODE: ${{ inputs.version_code }}
           PERMS: ${{ inputs.permissions }}
+          PKG: ${{ inputs.package_name }}
+          BUILD_ID: ${{ inputs.build_id }}
+          BUILDS_DIR: ${{ github.workspace }}/builds/${{ inputs.build_id }}
+          CFG_PATH: ${{ github.workspace }}/builds/${{ inputs.build_id }}/__config.json
 
       - name: Inject release signing config
         shell: bash
         run: |
           set -euo pipefail
           cd work
-          # Decode tolerantly (any stray whitespace from secret entry is
-          # stripped first), then prove the result is the real keystore —
-          # a truncated/corrupt secret fails HERE with a clear message
-          # instead of surfacing as a cryptic signing error later.
-          printf '%s' "${{ secrets.KEYSTORE_BASE64 }}" | tr -d '[:space:]' | base64 -d > android/app/release.keystore
-          keytool -list -keystore android/app/release.keystore -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" >/dev/null
+          # Keystore source: the user's own keystore when the build form
+          # sent one (__keystore.bin + __ks.json, committed by the Worker
+          # and deleted again by the cleanup step), otherwise the site
+          # release keystore from Secrets (decoded tolerantly — stray
+          # whitespace from secret entry is stripped first). Either way the
+          # credentials go to $GITHUB_ENV for the Gradle step, and the
+          # keystore is proven HERE: a bad alias/password fails with a
+          # clear message instead of a cryptic signing error later.
+          python3 - <<'PY'
+          import base64, json, os, pathlib, subprocess, sys
+          builds = pathlib.Path(os.environ["BUILDS_DIR"])
+          cfg = {}
+          cp = builds / "__config.json"
+          if cp.exists():
+              cfg = json.loads(cp.read_text())
+          dest = pathlib.Path(os.environ["KS_DEST"])
+          if cfg.get("keystoreMode") == "own" and (builds / "__keystore.bin").exists():
+              ks = json.loads((builds / "__ks.json").read_text())
+              dest.write_bytes((builds / "__keystore.bin").read_bytes())
+              pw, alias, keypw = ks["storePassword"], ks["alias"], ks.get("keyPassword") or ks["storePassword"]
+              print("Signing with the user's own keystore (alias " + alias + ")")
+          else:
+              dest.write_bytes(base64.b64decode("".join(os.environ["SECRET_KS_B64"].split())))
+              pw, alias, keypw = os.environ["SECRET_KS_PW"], os.environ["SECRET_KS_ALIAS"], os.environ["SECRET_KS_KEYPW"]
+              print("Signing with the site release keystore (alias " + alias + ")")
+          with open(os.environ["GITHUB_ENV"], "a") as fh:
+              fh.write("KEYSTORE_PASSWORD=" + pw + "\nKEY_ALIAS=" + alias + "\nKEY_PASSWORD=" + keypw + "\n")
+          r = subprocess.run(["keytool", "-list", "-keystore", str(dest), "-storepass", pw, "-alias", alias], capture_output=True, text=True)
+          if r.returncode != 0:
+              print(r.stdout)
+              print(r.stderr)
+              sys.exit("Keystore verification failed - check the keystore alias and password.")
+          PY
           python3 - <<'PY'
           import pathlib
           g = pathlib.Path("android/app/build.gradle")
@@ -257,9 +525,12 @@ jobs:
           g.write_text(t)
           PY
         env:
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          BUILDS_DIR: ${{ github.workspace }}/builds/${{ inputs.build_id }}
+          KS_DEST: android/app/release.keystore
+          SECRET_KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          SECRET_KS_PW: ${{ secrets.KEYSTORE_PASSWORD }}
+          SECRET_KS_ALIAS: ${{ secrets.KEY_ALIAS }}
+          SECRET_KS_KEYPW: ${{ secrets.KEY_PASSWORD }}
 
       - name: Build release APK
         shell: bash
@@ -275,10 +546,6 @@ jobs:
           APKSIGNER=$(find "$ANDROID_HOME/build-tools" -maxdepth 2 -name apksigner -type f | sort -V | tail -n 1)
           [ -n "$APKSIGNER" ] || { echo "apksigner not found under $ANDROID_HOME/build-tools"; exit 1; }
           "$APKSIGNER" verify --print-certs "$GITHUB_WORKSPACE/app-release-${{ inputs.build_id }}.apk" | head -5
-        env:
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
@@ -286,6 +553,46 @@ jobs:
           name: app-release-${{ inputs.build_id }}
           path: app-release-${{ inputs.build_id }}.apk
           retention-days: 7
+
+      - name: Notify build webhook
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, pathlib, urllib.request
+          builds = pathlib.Path(os.environ["BUILDS_DIR"])
+          cfg = {}
+          cp = builds / "__config.json"
+          if cp.exists():
+              cfg = json.loads(cp.read_text())
+          url = cfg.get("webhookUrl") or ""
+          if not url:
+              print("No build webhook configured")
+              raise SystemExit(0)
+          payload = {
+              "event": "build_finished",
+              "buildId": os.environ["BUILD_ID"],
+              "status": os.environ["JOB_STATUS"],
+              "appName": os.environ["APP_NAME"],
+              "packageName": os.environ["PKG"],
+              "projectType": os.environ["PTYPE"],
+              "runUrl": "https://github.com/" + os.environ["GITHUB_REPOSITORY"] + "/actions/runs/" + os.environ["GITHUB_RUN_ID"],
+          }
+          req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json", "User-Agent": "ar-apk-build-webhook"})
+          try:
+              with urllib.request.urlopen(req, timeout=15) as r:
+                  print("Webhook delivered:", r.status)
+          except Exception as e:
+              print("Webhook delivery failed:", e)
+          PYEOF
+        env:
+          BUILDS_DIR: ${{ github.workspace }}/builds/${{ inputs.build_id }}
+          BUILD_ID: ${{ inputs.build_id }}
+          JOB_STATUS: ${{ job.status }}
+          APP_NAME: ${{ inputs.app_name }}
+          PKG: ${{ inputs.package_name }}
+          PTYPE: ${{ inputs.project_type }}
 
       - name: Clean up delivered project files
         if: always()
@@ -353,6 +660,11 @@ jobs:
           [ -n "$SDKMANAGER" ] || { echo "sdkmanager not found under $ANDROID_HOME/cmdline-tools"; exit 1; }
           yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
           "$SDKMANAGER" "platforms;android-34" "build-tools;34.0.0" "platform-tools"
+          # Target SDK chosen in the build form (default 34).
+          TGT=$(python3 -c "import json;print(json.load(open('$GITHUB_WORKSPACE/builds/$BUILD_ID/__config.json')).get('targetSdk',34))" 2>/dev/null || echo 34)
+          if [ "$TGT" != "34" ]; then "$SDKMANAGER" "platforms;android-$TGT" "build-tools;$TGT.0.0"; fi
+        env:
+          BUILD_ID: ${{ inputs.build_id }}
 
       - name: Setup Gradle 8.2
         uses: gradle/actions/setup-gradle@v4
@@ -365,7 +677,7 @@ jobs:
           set -euo pipefail
           python3 -m pip install --quiet pillow
           python3 - <<'PY'
-          import os, re, shutil, sys, urllib.request
+          import json, os, re, shutil, sys, urllib.request
           from pathlib import Path
 
           build_id = os.environ["BUILD_ID"]
@@ -381,6 +693,16 @@ jobs:
           if not src_dir.is_dir():
               print(f"ERROR: no project files found at builds/{build_id}")
               sys.exit(1)
+          # Build-form settings committed by the Worker (__config.json).
+          cfg = {}
+          cfg_path = src_dir / "__config.json"
+          if cfg_path.exists():
+              cfg = json.loads(cfg_path.read_text())
+          min_sdk = int(cfg.get("minSdk", 24))
+          target_sdk = int(cfg.get("targetSdk", 34))
+          orient = cfg.get("orientation", "auto")
+          minify = bool(cfg.get("minify", False))
+          print("Build config: minSdk", min_sdk, "targetSdk", target_sdk, "orientation", orient, "minify", minify)
           all_files = [p for p in src_dir.rglob("*") if p.is_file()]
           print("Project files:", [str(p.relative_to(src_dir)) for p in all_files])
 
@@ -421,11 +743,14 @@ jobs:
           #  the project's own folder structure under assets/)
           assets_dir = app / "src/main/assets"
           skip_names = {"AndroidManifest.xml", "settings.gradle", "gradle.properties",
-                        "build.gradle", ".gitignore"}
+                        "build.gradle", "build.gradle.kts", ".gitignore",
+                        "gradlew", "gradlew.bat"}
           for p in all_files:
               rel = p.relative_to(src_dir)
               parts = rel.parts
               if p.suffix in (".kt", ".java"):
+                  continue
+              if p.name.startswith("__"):
                   continue
               if "res" in parts or p.name in skip_names:
                   continue
@@ -480,6 +805,15 @@ jobs:
               text = manifest_src.read_text()
               # AGP 8 takes the package from the Gradle namespace instead.
               text = re.sub(r'\s+package="[^"]*"', "", text, count=1)
+              if orient in ("portrait", "landscape") and "screenOrientation" not in text:
+                  m = re.search(r"<activity\b[^>]*>(?:(?!</activity>).)*?LAUNCHER", text, re.S)
+                  if m:
+                      pos = m.start() + len("<activity")
+                      text = text[:pos] + ' android:screenOrientation="' + orient + '"' + text[pos:]
+                  elif "<activity" in text:
+                      pos = text.index("<activity") + len("<activity")
+                      text = text[:pos] + ' android:screenOrientation="' + orient + '"' + text[pos:]
+                  print("Orientation locked on the project's own manifest:", orient)
               (app / "src/main/AndroidManifest.xml").write_text(text)
               print("Using the project's own AndroidManifest.xml")
           else:
@@ -487,6 +821,7 @@ jobs:
                   extra = ' android:maxSdkVersion="28"' if x == "android.permission.WRITE_EXTERNAL_STORAGE" else ""
                   return f'    <uses-permission android:name="{x}"{extra} />\n'
               perm_lines = "".join(perm_tag(x) for x in perms)
+              orient_attr = f'\n            android:screenOrientation="{orient}"' if orient in ("portrait", "landscape") else ""
               manifest = f'''<?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
           {perm_lines}    <application
@@ -497,7 +832,7 @@ jobs:
                   android:allowBackup="true"
                   android:supportsRtl="true">
                   <activity
-                      android:name=".{main_cls}"
+                      android:name=".{main_cls}"{orient_attr}
                       android:exported="true">
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN" />
@@ -518,10 +853,34 @@ jobs:
               '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n'
               '    <style name="AppTheme" parent="Theme.AppCompat.Light.NoActionBar" />\n</resources>\n')
 
+          # --- splash screen (uploaded image -> windowBackground drawable) ---
+          splash_file = src_dir / "__splash.img"
+          if splash_file.exists():
+              from PIL import Image as PILImage
+              simg = PILImage.open(splash_file).convert("RGB")
+              (res_dir / "drawable").mkdir(parents=True, exist_ok=True)
+              simg.resize((480, 800)).save(res_dir / "drawable" / "splash.png")
+              (res_dir / "drawable" / "splash_bg.xml").write_text(
+                  '<?xml version="1.0" encoding="utf-8"?>\n'
+                  '<layer-list xmlns:android="http://schemas.android.com/apk/res/android">\n'
+                  '    <item android:drawable="@android:color/white" />\n'
+                  '    <item>\n'
+                  '        <bitmap android:gravity="center" android:src="@drawable/splash" />\n'
+                  '    </item>\n'
+                  '</layer-list>\n')
+              themes = (res_dir / "values/themes.xml").read_text()
+              themes = themes.replace("</style>",
+                  '    <item name="android:windowBackground">@drawable/splash_bg</item>\n    </style>', 1)
+              (res_dir / "values/themes.xml").write_text(themes)
+              print("Splash screen applied")
+
           # --- launcher icons ---
           from PIL import Image
           sizes = {"mdpi": 48, "hdpi": 72, "xhdpi": 96, "xxhdpi": 144, "xxxhdpi": 192}
-          if icon_url:
+          icon_file = src_dir / "__icon.img"
+          if icon_file.exists():
+              src_img = Image.open(icon_file).convert("RGBA")
+          elif icon_url:
               urllib.request.urlretrieve(icon_url, "/tmp/icon.png")
               src_img = Image.open("/tmp/icon.png").convert("RGBA")
           else:
@@ -561,11 +920,11 @@ jobs:
           (app / "build.gradle").write_text(f'''apply plugin: 'com.android.application'
           {kotlin_plugin}android {{
               namespace '{pkg}'
-              compileSdk 34
+              compileSdk {target_sdk}
               defaultConfig {{
                   applicationId '{pkg}'
-                  minSdk 24
-                  targetSdk 34
+                  minSdk {min_sdk}
+                  targetSdk {target_sdk}
                   versionCode {vcode}
                   versionName '{vname}'
               }}
@@ -580,7 +939,7 @@ jobs:
               buildTypes {{
                   release {{
                       signingConfig signingConfigs.release
-                      minifyEnabled false
+                      minifyEnabled {'true' if minify else 'false'}
                   }}
               }}
               compileOptions {{
@@ -608,11 +967,42 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          printf '%s' "${{ secrets.KEYSTORE_BASE64 }}" | tr -d '[:space:]' | base64 -d > work/app/release.keystore
-          keytool -list -keystore work/app/release.keystore -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" >/dev/null
+          # User's own keystore when the build form sent one, else the site
+          # release keystore from Secrets. Credentials go to $GITHUB_ENV for
+          # the Gradle step; the keystore is verified here with a clear
+          # error instead of a cryptic signing failure later.
+          python3 - <<'PY'
+          import base64, json, os, pathlib, subprocess, sys
+          builds = pathlib.Path(os.environ["BUILDS_DIR"])
+          cfg = {}
+          cp = builds / "__config.json"
+          if cp.exists():
+              cfg = json.loads(cp.read_text())
+          dest = pathlib.Path(os.environ["KS_DEST"])
+          if cfg.get("keystoreMode") == "own" and (builds / "__keystore.bin").exists():
+              ks = json.loads((builds / "__ks.json").read_text())
+              dest.write_bytes((builds / "__keystore.bin").read_bytes())
+              pw, alias, keypw = ks["storePassword"], ks["alias"], ks.get("keyPassword") or ks["storePassword"]
+              print("Signing with the user's own keystore (alias " + alias + ")")
+          else:
+              dest.write_bytes(base64.b64decode("".join(os.environ["SECRET_KS_B64"].split())))
+              pw, alias, keypw = os.environ["SECRET_KS_PW"], os.environ["SECRET_KS_ALIAS"], os.environ["SECRET_KS_KEYPW"]
+              print("Signing with the site release keystore (alias " + alias + ")")
+          with open(os.environ["GITHUB_ENV"], "a") as fh:
+              fh.write("KEYSTORE_PASSWORD=" + pw + "\nKEY_ALIAS=" + alias + "\nKEY_PASSWORD=" + keypw + "\n")
+          r = subprocess.run(["keytool", "-list", "-keystore", str(dest), "-storepass", pw, "-alias", alias], capture_output=True, text=True)
+          if r.returncode != 0:
+              print(r.stdout)
+              print(r.stderr)
+              sys.exit("Keystore verification failed - check the keystore alias and password.")
+          PY
         env:
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          BUILDS_DIR: ${{ github.workspace }}/builds/${{ inputs.build_id }}
+          KS_DEST: work/app/release.keystore
+          SECRET_KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          SECRET_KS_PW: ${{ secrets.KEYSTORE_PASSWORD }}
+          SECRET_KS_ALIAS: ${{ secrets.KEY_ALIAS }}
+          SECRET_KS_KEYPW: ${{ secrets.KEY_PASSWORD }}
 
       - name: Build release APK (native)
         shell: bash
@@ -626,10 +1016,6 @@ jobs:
           APKSIGNER=$(find "$ANDROID_HOME/build-tools" -maxdepth 2 -name apksigner -type f | sort -V | tail -n 1)
           [ -n "$APKSIGNER" ] || { echo "apksigner not found under $ANDROID_HOME/build-tools"; exit 1; }
           "$APKSIGNER" verify --print-certs "$GITHUB_WORKSPACE/app-release-${{ inputs.build_id }}.apk" | head -5
-        env:
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
@@ -637,6 +1023,46 @@ jobs:
           name: app-release-${{ inputs.build_id }}
           path: app-release-${{ inputs.build_id }}.apk
           retention-days: 7
+
+      - name: Notify build webhook
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, pathlib, urllib.request
+          builds = pathlib.Path(os.environ["BUILDS_DIR"])
+          cfg = {}
+          cp = builds / "__config.json"
+          if cp.exists():
+              cfg = json.loads(cp.read_text())
+          url = cfg.get("webhookUrl") or ""
+          if not url:
+              print("No build webhook configured")
+              raise SystemExit(0)
+          payload = {
+              "event": "build_finished",
+              "buildId": os.environ["BUILD_ID"],
+              "status": os.environ["JOB_STATUS"],
+              "appName": os.environ["APP_NAME"],
+              "packageName": os.environ["PKG"],
+              "projectType": os.environ["PTYPE"],
+              "runUrl": "https://github.com/" + os.environ["GITHUB_REPOSITORY"] + "/actions/runs/" + os.environ["GITHUB_RUN_ID"],
+          }
+          req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json", "User-Agent": "ar-apk-build-webhook"})
+          try:
+              with urllib.request.urlopen(req, timeout=15) as r:
+                  print("Webhook delivered:", r.status)
+          except Exception as e:
+              print("Webhook delivery failed:", e)
+          PYEOF
+        env:
+          BUILDS_DIR: ${{ github.workspace }}/builds/${{ inputs.build_id }}
+          BUILD_ID: ${{ inputs.build_id }}
+          JOB_STATUS: ${{ job.status }}
+          APP_NAME: ${{ inputs.app_name }}
+          PKG: ${{ inputs.package_name }}
+          PTYPE: ${{ inputs.project_type }}
 
       - name: Clean up delivered project files
         if: always()
